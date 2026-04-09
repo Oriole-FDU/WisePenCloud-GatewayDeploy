@@ -52,7 +52,7 @@ function init_infrastructure() {
                     "allow_origins": "http://127.0.0.1",
                     "allow_origins_by_regex": $cors_regex_arr,
                     "allow_methods": "GET,POST,PUT,DELETE,PATCH,HEAD,OPTIONS",
-                    "allow_headers": "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Range,X-Developer",
+                    "allow_headers": "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Range,X-Developer,ETag,Last-Modified",
                     "expose_headers": "Accept-Ranges,Content-Range,Content-Length",
                     "allow_credential": true,
                     "max_age": 3600
