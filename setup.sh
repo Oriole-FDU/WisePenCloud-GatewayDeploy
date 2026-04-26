@@ -17,6 +17,8 @@ fi
 
 # 全局模版
 TPL_ID_GLOBAL=1
+ROUTE_ID_PING=1
+LUA_PING=""
 
 # ================= 工具函数 =================
 
@@ -58,6 +60,7 @@ function init_infrastructure() {
     local LUA_AUTH
     LUA_AUTH=$(load_lua_script "$AUTH_TMP")
     rm -f "$AUTH_TMP"
+    LUA_PING=$(load_lua_script "./scripts/ping.lua")
 
     echo ">>> [2/2] 初始化全局模板 (ID: ${TPL_ID_GLOBAL})..."
     local body_global=$(jq -n \
@@ -106,6 +109,37 @@ function init_infrastructure() {
 }
 
 # ================= 路由注册函数 =================
+
+# 注册本地 /ping 健康检查路由
+function register_ping_route() {
+    echo ">>> 注册本地路由 [ping] -> APISIX"
+
+    local body=$(jq -n \
+        --argjson script_ping "$LUA_PING" \
+        '{
+            name: "ping",
+            uri: "/ping",
+            plugins: {
+                "serverless-pre-function": {
+                    phase: "rewrite",
+                    functions: [$script_ping]
+                }
+            }
+        }')
+
+    local RESPONSE=$(curl -s --noproxy "*" -w "\n%{http_code}" "${APISIX_ADMIN}/apisix/admin/routes/${ROUTE_ID_PING}" -X PUT \
+      -H "X-API-KEY: ${ADMIN_KEY}" \
+      -d "$body")
+
+    local HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
+    local HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1)
+
+    if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+        echo "❌ [Error] 本地路由 [ping] 注册失败！状态码: ${HTTP_STATUS}"
+        echo ">>> APISIX 报错详情: ${HTTP_BODY}"
+        exit 1
+    fi
+}
 
 # 注册服务
 # 参数：ID, Name, URI, NacosService, TemplateID
@@ -159,6 +193,9 @@ echo -e "\n-----------------------------------------"
 
 # 注册服务
 # 格式: register_route  <ID>  <描述>  <路径>  <Nacos服务名>
+
+# 注册网关本地健康检查
+register_ping_route
 
 # 注册服务
 # user-service
