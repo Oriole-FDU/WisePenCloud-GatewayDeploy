@@ -13,8 +13,20 @@ return function(conf, ctx)
         return
     end
 
-    -- 获取请求头中的 X-Developer
+    -- 普通 HTTP 使用 Header；浏览器 WebSocket 无法自定义 Header，改由查询参数透传
     local target_dev = core.request.header(ctx, "X-Developer")
+    if not target_dev or target_dev == "" then
+        local query_dev = ctx.var.arg_developer
+        if query_dev and query_dev ~= "" then
+            local matched = ngx.re.match(query_dev, [[^[A-Za-z0-9._-]{1,64}$]], "jo")
+            if matched then
+                target_dev = query_dev
+                core.request.set_header(ctx, "X-Developer", target_dev)
+            else
+                core.log.warn(">>> [Dev-Isolation] Invalid developer query ignored")
+            end
+        end
+    end
 
     -- 获取 Upstream 配置
     local route = ctx.matched_route
