@@ -1,5 +1,6 @@
 [
   "^http://localhost:\\d+$",
   "^http://127\\.0\\.0\\.1:\\d+$",
-  "^https?://.*\\.oriole\\.cn(:\\d+)?$"
+  "^https?://.*\\.oriole\\.cn(:\\d+)?$",
+  "^app://wisepen$"
 ]
