@@ -350,16 +350,16 @@ register_route 501 "document-service" '["/document/*","/external/document/*"]' "
 register_route 601 "file-storage-service" '["/storage/*","/external/storage/*"]' "wisepen-file-storage-service"
 register_route 701 "note-service" "/note/*" "wisepen-note-service"
 
-# note-collab-service 需要启用 WebSocket 支持，同时进行一致性哈希路由
+# note-collab-service 仅透传业务 WebSocket 入口；.websocket 是 express-ws 内部路径，网关不做改写
 WS_CONFIG='{
     "enable_websocket": true,
     "upstream": {
         "type": "chash",
         "hash_on": "vars",
-        "key": "remote_addr"
+        "key": "arg_resourceId"
     }
 }'
-register_route 702 "note-collab-service" "/note-collab/*" "wisepen-note-collab-service" "$WS_CONFIG"
+register_route 702 "note-collab-service" "/note-collab/ws" "wisepen-note-collab-service" "$WS_CONFIG"
 
 # 注册前端服务
 register_frontend_route 3 '["/assets/*","/*"]'
