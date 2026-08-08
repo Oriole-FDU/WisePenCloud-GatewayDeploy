@@ -10,6 +10,7 @@ return function(conf, ctx)
     -- 清洗 Header 抵御伪造
     core.request.set_header(ctx, "X-User-Id", nil)
     core.request.set_header(ctx, "X-Identity-Type", nil)
+    core.request.set_header(ctx, "X-User-Status", nil)
     core.request.set_header(ctx, "X-Group-Role-Map", nil)
 
     -- 请求来源标记
@@ -39,6 +40,7 @@ return function(conf, ctx)
     -- 注意：必须在 APISIX 的 config.yaml 中提前定义好这个共享内存块
     local local_cache = ngx.shared.session_cache
     local session_json = local_cache and local_cache:get(session_id)
+    local fetched_from_redis = false
 
     if session_json == "INVALID" then
         -- 放行，后端处理
@@ -89,11 +91,7 @@ return function(conf, ctx)
             return
         end
 
-        -- 将查到的结果写回 L1 内存缓存，存活 5 分钟 (300秒)
-        -- 接下来的 5 分钟内，该用户的请求都不会再引发 Redis 网络 I/O
-        if local_cache then
-            local_cache:set(session_id, session_json, 300)
-        end
+        fetched_from_redis = true
 
         -- 滑动续期，把 Redis 中 Key 的寿命重新拉回 7 天
         -- 7 天 = 7 * 24 * 3600 = 604800 秒
@@ -112,12 +110,23 @@ return function(conf, ctx)
         return
     end
 
+    -- status 会参与后端身份鉴权；未认证 session 不写 L1，避免认证完成后继续使用旧状态。
+    if fetched_from_redis and local_cache and tostring(session_data.status) ~= "-1" then
+        -- 将查到的结果写回 L1 内存缓存，存活 5 分钟 (300秒)
+        -- 接下来的 5 分钟内，该用户的请求都不会再引发 Redis 网络 I/O
+        local_cache:set(session_id, session_json, 300)
+    end
+
     if session_data.userId then
         core.request.set_header(ctx, "X-User-Id", tostring(session_data.userId))
     end
 
     if session_data.identityType then
         core.request.set_header(ctx, "X-Identity-Type", tostring(session_data.identityType))
+    end
+
+    if session_data.status then
+        core.request.set_header(ctx, "X-User-Status", tostring(session_data.status))
     end
 
     if session_data.groupRoleMap then
