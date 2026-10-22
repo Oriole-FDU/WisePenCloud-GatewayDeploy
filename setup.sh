@@ -107,6 +107,7 @@ function init_infrastructure() {
     echo ">>> [1/2] 加载 Lua 脚本..."
     # 获取转义后的 Lua 脚本字符串
     local LUA_ROUTE=$(load_lua_script "./scripts/route.lua")
+    local LUA_REQUEST_ID=$(load_lua_script "./scripts/request_id.lua")
     local AUTH_TMP
     AUTH_TMP=$(mktemp)
     sed -e "s|@@REDIS_PASSWORD_B64@@|${REDIS_PASSWORD_B64}|g" \
@@ -121,6 +122,7 @@ function init_infrastructure() {
     echo ">>> [2/2] 初始化全局模板 (ID: ${TPL_ID_GLOBAL})..."
     local body_global=$(jq -n \
         --argjson script_route "$LUA_ROUTE" \
+        --argjson script_request_id "$LUA_REQUEST_ID" \
         --argjson script_auth "$LUA_AUTH" \
         --argjson cors_regex_arr "$CORS_REGEX_JSON" \
         '{
@@ -128,9 +130,6 @@ function init_infrastructure() {
             plugins: {
                 "prometheus": {},
                 "opentelemetry": {},
-                "request-id": {
-                    "include_in_response": true
-                },
                 "cors": {
                     "allow_origins": "http://127.0.0.1",
                     "allow_origins_by_regex": $cors_regex_arr,
@@ -149,7 +148,7 @@ function init_infrastructure() {
                 },
                 "serverless-pre-function": {
                     "phase": "rewrite",
-                    "functions": [$script_route, $script_auth]
+                    "functions": [$script_route, $script_auth, $script_request_id]
                 }
             }
         }')
