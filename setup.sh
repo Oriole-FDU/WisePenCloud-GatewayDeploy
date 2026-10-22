@@ -336,12 +336,15 @@ function register_frontend_route() {
 # 只放行 traces/logs 两个上报路径，Collector 本身仍留在容器网络内。
 function register_otel_route() {
     local ID=${1:-902}
+    local LUA_OTEL_REWRITE
+    LUA_OTEL_REWRITE=$(load_lua_script "./scripts/otel_rewrite.lua")
 
     echo ">>> 注册 OTLP 入口 [otel] -> http://${OTEL_COLLECTOR_HOST}:${OTEL_COLLECTOR_PORT}"
 
     local body=$(jq -n \
         --arg host "$OTEL_COLLECTOR_HOST" \
         --argjson port "$OTEL_COLLECTOR_PORT" \
+        --argjson script_otel_rewrite "$LUA_OTEL_REWRITE" \
         --argjson cors_regex_arr "$CORS_REGEX_JSON" \
         '{
             name: "otel-ingress",
@@ -357,18 +360,9 @@ function register_otel_route() {
                     "allow_credential": false,
                     "max_age": 3600
                 },
-                "proxy-rewrite": {
-                    "regex_uri": ["^/otel/(.*)", "/$1"]
-                },
-                "limit-count": {
-                    "count": 1200,
-                    "time_window": 60,
-                    "rejected_code": 429,
-                    "rejected_msg": "telemetry rate limit exceeded",
-                    "policy": "local",
-                    "key_type": "var",
-                    "key": "remote_addr",
-                    "show_limit_quota_header": false
+                "serverless-pre-function": {
+                    "phase": "rewrite",
+                    "functions": [$script_otel_rewrite]
                 }
             },
             upstream: {
