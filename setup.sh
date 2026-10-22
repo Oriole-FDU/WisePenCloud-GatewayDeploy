@@ -361,9 +361,6 @@ function register_otel_route() {
                 "proxy-rewrite": {
                     "regex_uri": ["^/otel/(.*)", "/$1"]
                 },
-                "client-control": {
-                    "max_body_size": 4194304
-                },
                 "limit-count": {
                     "count": 1200,
                     "time_window": 60,
