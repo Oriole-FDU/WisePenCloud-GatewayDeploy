@@ -60,6 +60,19 @@ if [ -n "$FRONTEND_HOST" ]; then
     fi
 fi
 
+# 前端 OTel 入口。APISIX 必须与 otel-collector 处于同一容器网络。
+OTEL_COLLECTOR_HOST=${OTEL_COLLECTOR_HOST:-otel-collector}
+OTEL_COLLECTOR_PORT=${OTEL_COLLECTOR_PORT:-4318}
+if ! printf '%s' "$OTEL_COLLECTOR_PORT" | grep -Eq '^[0-9]+$'; then
+    echo "错误: OTEL_COLLECTOR_PORT 必须是数字，当前值: ${OTEL_COLLECTOR_PORT}"
+    exit 1
+fi
+OTEL_COLLECTOR_PORT=$((10#$OTEL_COLLECTOR_PORT))
+if [ "$OTEL_COLLECTOR_PORT" -lt 1 ] || [ "$OTEL_COLLECTOR_PORT" -gt 65535 ]; then
+    echo "错误: OTEL_COLLECTOR_PORT 必须在 1-65535 之间，当前值: ${OTEL_COLLECTOR_PORT}"
+    exit 1
+fi
+
 # ================= 工具函数 =================
 
 # 检查 jq 是否安装
@@ -115,12 +128,15 @@ function init_infrastructure() {
             plugins: {
                 "prometheus": {},
                 "opentelemetry": {},
+                "request-id": {
+                    "include_in_response": true
+                },
                 "cors": {
                     "allow_origins": "http://127.0.0.1",
                     "allow_origins_by_regex": $cors_regex_arr,
                     "allow_methods": "GET,POST,PUT,DELETE,PATCH,HEAD,OPTIONS",
-                    "allow_headers": "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Range,X-Developer,ETag,Last-Modified,Access-Control-Request-Private-Network",
-                    "expose_headers": "Accept-Ranges,Content-Range,Content-Length",
+                    "allow_headers": "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Range,X-Developer,ETag,Last-Modified,Access-Control-Request-Private-Network,traceparent,tracestate,baggage",
+                    "expose_headers": "Accept-Ranges,Content-Range,Content-Length,X-Request-Id",
                     "allow_credential": true,
                     "max_age": 3600
                 },
@@ -227,8 +243,8 @@ function register_ping_route() {
                     "allow_origins": "http://127.0.0.1",
                     "allow_origins_by_regex": $cors_regex_arr,
                     "allow_methods": "GET,HEAD,OPTIONS",
-                    "allow_headers": "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Range,X-Developer,ETag,Last-Modified,Access-Control-Request-Private-Network",
-                    "expose_headers": "Accept-Ranges,Content-Range,Content-Length",
+                    "allow_headers": "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Range,X-Developer,ETag,Last-Modified,Access-Control-Request-Private-Network,traceparent,tracestate,baggage",
+                    "expose_headers": "Accept-Ranges,Content-Range,Content-Length,X-Request-Id",
                     "allow_credential": true,
                     "max_age": 3600
                 },
@@ -317,6 +333,78 @@ function register_frontend_route() {
     fi
 }
 
+# 注册前端 OTLP HTTP 入口。
+# 只放行 traces/logs 两个上报路径，Collector 本身仍留在容器网络内。
+function register_otel_route() {
+    local ID=${1:-902}
+
+    echo ">>> 注册 OTLP 入口 [otel] -> http://${OTEL_COLLECTOR_HOST}:${OTEL_COLLECTOR_PORT}"
+
+    local body=$(jq -n \
+        --arg host "$OTEL_COLLECTOR_HOST" \
+        --argjson port "$OTEL_COLLECTOR_PORT" \
+        --argjson cors_regex_arr "$CORS_REGEX_JSON" \
+        '{
+            name: "otel-ingress",
+            uris: ["/otel/v1/traces", "/otel/v1/logs"],
+            methods: ["POST", "OPTIONS"],
+            priority: 100,
+            plugins: {
+                "cors": {
+                    "allow_origins": "http://127.0.0.1",
+                    "allow_origins_by_regex": $cors_regex_arr,
+                    "allow_methods": "POST,OPTIONS",
+                    "allow_headers": "Content-Type",
+                    "allow_credential": false,
+                    "max_age": 3600
+                },
+                "proxy-rewrite": {
+                    "regex_uri": ["^/otel/(.*)", "/$1"]
+                },
+                "limit-count": {
+                    "count": 1200,
+                    "time_window": 60,
+                    "rejected_code": 429,
+                    "rejected_msg": "telemetry rate limit exceeded",
+                    "policy": "local",
+                    "key_type": "var",
+                    "key": "remote_addr",
+                    "show_limit_quota_header": false
+                }
+            },
+            upstream: {
+                type: "roundrobin",
+                scheme: "http",
+                pass_host: "node",
+                timeout: {
+                    connect: 2,
+                    send: 5,
+                    read: 5
+                },
+                nodes: [
+                    {
+                        host: $host,
+                        port: $port,
+                        weight: 1
+                    }
+                ]
+            }
+        }')
+
+    local RESPONSE=$(curl -s --noproxy "*" -w "\n%{http_code}" "${APISIX_ADMIN}/apisix/admin/routes/${ID}" -X PUT \
+        -H "X-API-KEY: ${ADMIN_KEY}" \
+        -d "$body")
+
+    local HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
+    local HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1)
+
+    if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+        echo "❌ [Error] 路由 [otel] 注册失败！状态码: ${HTTP_STATUS}"
+        echo ">>> APISIX 报错详情: ${HTTP_BODY}"
+        exit 1
+    fi
+}
+
 echo "========================================="
 echo "   WisePen 网关部署脚本"
 echo "========================================="
@@ -370,6 +458,9 @@ register_route 801 "system-feedback-service" "/system/feedback/addFeedback" "wis
 
 # 注册前端服务
 register_frontend_route 3 '["/assets/*","/*"]'
+
+# 注册前端 OTel 上报入口
+register_otel_route 902
 
 echo -e "\n========================================="
 echo "所有配置已推送到 APISIX !"
