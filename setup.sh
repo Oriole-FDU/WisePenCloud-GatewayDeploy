@@ -454,18 +454,15 @@ WS_CONFIG='{
 }'
 register_route 702 "note-collab-service" "/note-collab/*" "wisepen-note-collab-service" "$WS_CONFIG"
 
-# 仅暴露用户反馈接口。
-# system-service 下的邮件发送、操作日志等接口属于内部服务调用，不能通过网关整体暴露。
-SYSTEM_FEEDBACK_CONFIG='{
-    "methods": ["POST", "OPTIONS"]
-}'
-register_route 801 "system-feedback-service" "/system/feedback/addFeedback" "wisepen-system-service" "$SYSTEM_FEEDBACK_CONFIG"
+register_route 801 "system-service" "/system/*" "wisepen-system-service"
+
+register_route 901 "web-app-service" "/singleHtmlPage/*" "wisepen-web-app-service"
 
 # 注册前端服务
 register_frontend_route 3 '["/assets/*","/*"]'
 
 # 注册前端 OTel 上报入口
-register_otel_route 902
+register_otel_route 999
 
 echo -e "\n========================================="
 echo "所有配置已推送到 APISIX !"
