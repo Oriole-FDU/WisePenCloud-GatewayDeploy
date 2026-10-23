@@ -129,7 +129,19 @@ function init_infrastructure() {
             desc: "WisePen Global Template (Monitor + Routing + Auth + CORS)",
             plugins: {
                 "prometheus": {},
-                "opentelemetry": {},
+                "opentelemetry": {
+                    sampler: {
+                        name: "parent_base",
+                        options: {
+                            root: {
+                                name: "always_on",
+                                options: {
+                                    fraction: 0
+                                }
+                            }
+                        }
+                    }
+                },
                 "cors": {
                     "allow_origins": "http://127.0.0.1",
                     "allow_origins_by_regex": $cors_regex_arr,
