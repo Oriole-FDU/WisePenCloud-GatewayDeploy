@@ -1,4 +1,5 @@
 #!/bin/bash
+set -eu
 
 # ================= 环境变量定义 =================
 SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,41 +12,52 @@ for env_file in "${SETUP_DIR}/.env"; do
 done
 
 # APISIX Admin API 地址
-APISIX_ADMIN_HOST=${APISIX_ADMIN_HOST:-apisix}
-APISIX_ADMIN_PORT=${APISIX_ADMIN_PORT:-9180}
-APISIX_ADMIN="http://${APISIX_ADMIN_HOST}:${APISIX_ADMIN_PORT}"
+APISIX_ADMIN=${APISIX_ADMIN_URL:-http://apisix:9180}
+case "$APISIX_ADMIN" in
+    http://*|https://*) ;;
+    *) echo "错误: APISIX_ADMIN_URL 必须使用 http:// 或 https://"; exit 1 ;;
+esac
+APISIX_ADMIN=${APISIX_ADMIN%/}
 
-# APISIX Admin Key
+# APISIX Admin Key 
 # Jenkins 参数或环境变量 APISIX_ADMIN_KEY 传入
-# 未设置时默认 edd1c9f034335f136f87ad84b625c8f1 （Dev Key）
-ADMIN_KEY=${APISIX_ADMIN_KEY:-edd1c9f034335f136f87ad84b625c8f1}
+: "${APISIX_ADMIN_KEY:?缺少 APISIX_ADMIN_KEY}"
+ADMIN_KEY=${APISIX_ADMIN_KEY}
 
 # Redis 地址
 REDIS_URL=${REDIS_URL:-redis}
 REDIS_PORT=${REDIS_PORT:-6379}
+: "${REDIS_URL:?缺少 REDIS_URL}"
+case "$REDIS_PORT" in
+    ''|*[!0-9]*) echo "错误: REDIS_PORT 必须是数字"; exit 1 ;;
+esac
+
 # Redis AUTH 密码
 # Jenkins 参数或环境变量 REDIS_AUTH_PASSWORD 传入
-# 未设置时默认 root
-REDIS_AUTH_PASSWORD=${REDIS_AUTH_PASSWORD:-root}
+: "${REDIS_AUTH_PASSWORD:?缺少 REDIS_AUTH_PASSWORD}"
 if command -v base64 >/dev/null 2>&1; then
-    REDIS_PASSWORD_B64=$(printf '%s' "$REDIS_AUTH_PASSWORD" | base64 -w0 2>/dev/null || printf '%s' "$REDIS_AUTH_PASSWORD" | base64 | tr -d '\n')
+    REDIS_PASSWORD_B64=$(printf '%s' "$REDIS_AUTH_PASSWORD" | base64 -w0 2>/dev/null || printf '%s' "$REDIS_AUTH_PASSWORD" | base64 | tr -d '\r\n')
 else
     echo "错误: 需要 base64 命令以生成 Redis 密码占位符"
     exit 1
 fi
 
-# 安全切口，由 APISIX 注入到 X-From-Source 头，下游服务校验
+# 安全切口由 APISIX 注入到 X-From-Source 头，下游服务校验
 # Jenkins 参数或环境变量 FROM_SOURCE_SECRET 传入
-# 未设置时默认 APISIX-wX0iR6tY
-FROM_SOURCE_SECRET=${FROM_SOURCE_SECRET:-APISIX-wX0iR6tY}
+: "${FROM_SOURCE_SECRET:?缺少 FROM_SOURCE_SECRET}"
+FROM_SOURCE_SECRET_B64=$(printf '%s' "$FROM_SOURCE_SECRET" | base64 -w0 2>/dev/null || printf '%s' "$FROM_SOURCE_SECRET" | base64 | tr -d '\r\n')
 
 # 全局模版
 TPL_ID_GLOBAL=1
 
-# docs-service 路由开关。默认不注册，由 Jenkins/.env 显式开启。
+# 可选服务路由开关，由 Jenkins 参数或环境变量根据实际部署能力传入
 DEPLOY_DOCS_ROUTE=${DEPLOY_DOCS_ROUTE:-false}
+DEPLOY_AI_ASSET_ROUTE=${DEPLOY_AI_ASSET_ROUTE:-true}
+DEPLOY_DOCUMENT_ROUTE=${DEPLOY_DOCUMENT_ROUTE:-true}
+DEPLOY_NOTE_ROUTE=${DEPLOY_NOTE_ROUTE:-true}
 
-# 前端静态站点 upstream。FRONTEND_HOST 留空时不注册 frontend 兜底路由。
+# 前端静态站点 upstream
+# FRONTEND_HOST 留空时不注册 frontend 兜底路由
 FRONTEND_HOST=${FRONTEND_HOST:-}
 FRONTEND_PORT=${FRONTEND_PORT:-8085}
 FRONTEND_SCHEME=${FRONTEND_SCHEME:-http}
@@ -83,7 +95,7 @@ fi
 
 # CORS 正则：环境变量 CORS_REGEX_JSON 非空则直接用，否则读仓库内 JSON
 CORS_DEFAULT_FILE="$SETUP_DIR/defaults/cors-allow-origins.json"
-if [ -z "${CORS_REGEX_JSON}" ]; then
+if [ -z "${CORS_REGEX_JSON:-}" ]; then
     if [ ! -f "$CORS_DEFAULT_FILE" ]; then
         echo "错误: 默认 CORS 文件缺失: $CORS_DEFAULT_FILE"
         exit 1
@@ -113,7 +125,7 @@ function init_infrastructure() {
     sed -e "s|@@REDIS_PASSWORD_B64@@|${REDIS_PASSWORD_B64}|g" \
         -e "s|@@REDIS_URL@@|${REDIS_URL}|g" \
         -e "s|@@REDIS_PORT@@|${REDIS_PORT}|g" \
-        -e "s|@@FROM_SOURCE_SECRET@@|${FROM_SOURCE_SECRET}|g" \
+        -e "s|@@FROM_SOURCE_SECRET_B64@@|${FROM_SOURCE_SECRET_B64}|g" \
         "./scripts/auth.lua" >"$AUTH_TMP"
     local LUA_AUTH
     LUA_AUTH=$(load_lua_script "$AUTH_TMP")
@@ -230,6 +242,28 @@ function register_route() {
     fi
 }
 
+# 删除不再启用的路由，避免重复部署后遗留仍可访问的旧入口
+function delete_route() {
+    local ID=$1
+    local NAME=$2
+    local RESPONSE
+    local HTTP_BODY
+    local HTTP_STATUS
+
+    echo ">>> 删除未启用路由 [$NAME]"
+    RESPONSE=$(curl -s --noproxy "*" -w "\n%{http_code}" \
+        "${APISIX_ADMIN}/apisix/admin/routes/${ID}" -X DELETE \
+        -H "X-API-KEY: ${ADMIN_KEY}")
+    HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
+    HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1)
+
+    if { [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; } && [ "$HTTP_STATUS" != "404" ]; then
+        echo "❌ [Error] 路由 [$NAME] 删除失败！状态码: ${HTTP_STATUS}"
+        echo ">>> APISIX 报错详情: ${HTTP_BODY}"
+        exit 1
+    fi
+}
+
 # 注册网关本地 /ping 健康检查路由
 # 不挂全局模板（避免走 auth/Redis），不依赖任何 Nacos 服务
 function register_ping_route() {
@@ -295,7 +329,7 @@ function register_frontend_route() {
     local ROUTE_MATCH
 
     if [ -z "$FRONTEND_HOST" ]; then
-        echo ">>> 跳过前端路由 [frontend]：FRONTEND_HOST 未设置"
+        delete_route "$ID" "frontend"
         return
     fi
 
@@ -425,7 +459,7 @@ register_ping_route 1 "/ping"
 if [ "$DEPLOY_DOCS_ROUTE" = "true" ]; then
     register_route 2 "docs-service" '["/docs","/docs/*"]' "wisepen-docs-service"
 else
-    echo ">>> 跳过路由 [docs-service]：DEPLOY_DOCS_ROUTE 未开启"
+    delete_route 2 "docs-service"
 fi
 
 # 注册服务
@@ -436,23 +470,38 @@ register_route 101 "auth-service" "/auth/*" "wisepen-user-service"
 register_route 102 "user-service" "/user/*" "wisepen-user-service"
 register_route 103 "group-service" "/group/*" "wisepen-user-service"
 register_route 201 "chat-service" "/chat/*" "wisepen-chat-service"
-register_route 301 "skill-service" "/skill/*" "wisepen-ai-asset-service"
-register_route 302 "agent-service" "/agent/*" "wisepen-ai-asset-service"
+if [ "$DEPLOY_AI_ASSET_ROUTE" = "true" ]; then
+    register_route 301 "skill-service" "/skill/*" "wisepen-ai-asset-service"
+    register_route 302 "agent-service" "/agent/*" "wisepen-ai-asset-service"
+else
+    delete_route 301 "skill-service"
+    delete_route 302 "agent-service"
+fi
 register_route 401 "resource-service" "/resource/*" "wisepen-resource-service"
-register_route 501 "document-service" '["/document/*","/external/document/*"]' "wisepen-document-service"
+if [ "$DEPLOY_DOCUMENT_ROUTE" = "true" ]; then
+    register_route 501 "document-service" '["/document/*","/external/document/*"]' "wisepen-document-service"
+else
+    delete_route 501 "document-service"
+fi
 register_route 601 "file-storage-service" '["/storage/*","/external/storage/*"]' "wisepen-file-storage-service"
-register_route 701 "note-service" "/note/*" "wisepen-note-service"
 
-# note-collab-service 需要启用 WebSocket 支持，同时进行一致性哈希路由
-WS_CONFIG='{
-    "enable_websocket": true,
-    "upstream": {
-        "type": "chash",
-        "hash_on": "vars",
-        "key": "remote_addr"
-    }
-}'
-register_route 702 "note-collab-service" "/note-collab/*" "wisepen-note-collab-service" "$WS_CONFIG"
+if [ "$DEPLOY_NOTE_ROUTE" = "true" ]; then
+    register_route 701 "note-service" "/note/*" "wisepen-note-service"
+
+    # note-collab-service 需要启用 WebSocket 支持，同时进行一致性哈希路由
+    WS_CONFIG='{
+        "enable_websocket": true,
+        "upstream": {
+            "type": "chash",
+            "hash_on": "vars",
+            "key": "remote_addr"
+        }
+    }'
+    register_route 702 "note-collab-service" "/note-collab/*" "wisepen-note-collab-service" "$WS_CONFIG"
+else
+    delete_route 701 "note-service"
+    delete_route 702 "note-collab-service"
+fi
 
 register_route 801 "system-service" "/system/*" "wisepen-system-service"
 

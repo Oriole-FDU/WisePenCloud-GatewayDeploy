@@ -14,9 +14,14 @@ return function(conf, ctx)
     core.request.set_header(ctx, "X-Group-Role-Map", nil)
 
     -- 请求来源标记
-    --（由 setup.sh 在部署时注入 @@FROM_SOURCE_SECRET@@ 占位符）
-    core.request.set_header(ctx, "X-From-Source", "@@FROM_SOURCE_SECRET@@")
-
+    -- 部署脚本注入 Base64，避免密钥中的特殊字符破坏 Lua 模板
+    local from_source_secret = ngx.decode_base64("@@FROM_SOURCE_SECRET_B64@@")
+    if not from_source_secret then
+        core.log.error(">>> [Auth] From-source secret decode failed")
+        core.response.exit(500, {code = 500, msg = "网关内部错误：鉴权配置不可用"})
+        return
+    end
+    core.request.set_header(ctx, "X-From-Source", from_source_secret)
 
     -- 提取名为 authorization 的 Cookie
     local session_id = ctx.var.cookie_authorization
