@@ -23,6 +23,7 @@ pipeline {
         booleanParam(name: 'DEPLOY_FRONTEND_ROUTE', defaultValue: false, description: '是否注册前端容器路由（OSS 部署时关闭）')
         string(name: 'FRONTEND_HOST', defaultValue: '', description: '前端服务 IP/Host。DEPLOY_FRONTEND_ROUTE 勾选时必填，留空则跳过注册前端路由。')
         string(name: 'FRONTEND_PORT', defaultValue: '80', description: '前端服务端口。')
+        booleanParam(name: 'DEPLOY_MCP_OAUTH_ROUTE', defaultValue: false, description: '是否注册 MCP 公网入口路由（/mcp + /oauth/* + well-known 元数据）')
     }
 
     environment {
@@ -105,6 +106,7 @@ pipeline {
                             "DEPLOY_NOTE_ROUTE=${params.DEPLOY_NOTE_ROUTE}",
                             "FRONTEND_HOST=${params.DEPLOY_FRONTEND_ROUTE ? params.FRONTEND_HOST.trim() : ''}",
                             "FRONTEND_PORT=${params.FRONTEND_PORT}",
+                            "DEPLOY_MCP_OAUTH_ROUTE=${params.DEPLOY_MCP_OAUTH_ROUTE}",
                         ]) {
                             sh "./setup.sh"
                         }

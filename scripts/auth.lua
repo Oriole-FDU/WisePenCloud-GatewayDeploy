@@ -44,17 +44,20 @@ return function(conf, ctx)
     -- ================= L1 缓存 (APISIX 极速内存字典) =================
     -- 注意：必须在 APISIX 的 config.yaml 中提前定义好这个共享内存块
     local local_cache = ngx.shared.session_cache
-    local session_json = local_cache and local_cache:get(session_id)
+    local context_cache_json = local_cache and local_cache:get("web:ctx:" .. session_id)
     local fetched_from_redis = false
 
-    if session_json == "INVALID" then
+    if context_cache_json == "INVALID" then
         -- 放行，后端处理
         return
     end
 
+    -- 使用 APISIX 内置的 core.json 安全解析
+    local context_cache_data = core.json.decode(context_cache_json)
+
     -- ================= L2 缓存 (Redis 兜底与同步) =================
     -- 未能命中缓存
-    if not session_json then
+    if not context_cache_data then
         local red = redis:new()
         -- 设置极短的超时时间(1秒)，防止 Redis 阻塞导致网关雪崩
         red:set_timeouts(1000, 1000, 1000)
@@ -83,12 +86,12 @@ return function(conf, ctx)
 
         -- 查库
         local redis_key = "wisepen:user:auth:session:" .. session_id
-        session_json, err = red:get(redis_key)
+        local session_json, err = red:get(redis_key)
 
         if not session_json or session_json == ngx.null then
             -- 没查到，说明登录过期
             if local_cache then
-                local_cache:set(session_id, "INVALID", 60)
+                local_cache:set("web:ctx:" .. session_id, "INVALID", 60)
             end
 
             red:set_keepalive(10000, 100) -- 归还连接池
@@ -102,39 +105,56 @@ return function(conf, ctx)
         -- 7 天 = 7 * 24 * 3600 = 604800 秒
         red:expire(redis_key, 604800)
 
+        -- 解析薄 session，拿到 userId
+        local session = core.json.decode(session_json)
+        if not session or not session.userId then
+            core.log.error(">>> [Auth] Session JSON Decode Failed for ID: ", session_id)
+            red:set_keepalive(10000, 100)
+            -- 放行，后端处理
+            return
+        end
+
+        -- 查 context
+        local context_json = red:get("wisepen:user:auth:context:" .. session.userId)
+
         -- 释放连接到连接池 (最大空闲时间 10 秒，池子大小 100)
         red:set_keepalive(10000, 100)
+
+        if not context_json or context_json == ngx.null then
+            -- 无 context，放行，后端处理
+            return
+        end
+
+        context_cache_data = core.json.decode(context_json)
+        if not context_cache_data then
+            core.log.error(">>> [Auth] Context JSON Decode Failed for User: ", session.userId)
+            -- 放行，后端处理
+            return
+        end
+        context_cache_data.userId = session.userId
     end
 
     -- ================= 解析数据并注入 Header =================
-    -- 使用 APISIX 内置的 core.json 安全解析
-    local session_data = core.json.decode(session_json)
-    if not session_data then
-        core.log.error(">>> [Auth] Session JSON Decode Failed for ID: ", session_id)
-        -- 放行，后端处理
-        return
-    end
-
     -- status 会参与后端身份鉴权；未认证 session 不写 L1，避免认证完成后继续使用旧状态。
-    if fetched_from_redis and local_cache and tostring(session_data.status) ~= "-1" then
+    if fetched_from_redis and local_cache and tostring(context_cache_data.status) ~= "-1" then
         -- 将查到的结果写回 L1 内存缓存，存活 5 分钟 (300秒)
         -- 接下来的 5 分钟内，该用户的请求都不会再引发 Redis 网络 I/O
-        local_cache:set(session_id, session_json, 300)
+        local_cache:set("web:ctx:" .. session_id, core.json.encode(context_cache_data), 300)
     end
 
-    if session_data.userId then
-        core.request.set_header(ctx, "X-User-Id", tostring(session_data.userId))
+    if context_cache_data.userId then
+        core.request.set_header(ctx, "X-User-Id", tostring(context_cache_data.userId))
     end
 
-    if session_data.identityType then
-        core.request.set_header(ctx, "X-Identity-Type", tostring(session_data.identityType))
+    if context_cache_data.identityType then
+        core.request.set_header(ctx, "X-Identity-Type", tostring(context_cache_data.identityType))
     end
 
-    if session_data.status then
-        core.request.set_header(ctx, "X-User-Status", tostring(session_data.status))
+    if context_cache_data.status then
+        core.request.set_header(ctx, "X-User-Status", tostring(context_cache_data.status))
     end
 
-    if session_data.groupRoleMap then
-        core.request.set_header(ctx, "X-Group-Role-Map", core.json.encode(session_data.groupRoleMap))
+    if context_cache_data.groupRoleMap then
+        core.request.set_header(ctx, "X-Group-Role-Map", core.json.encode(context_cache_data.groupRoleMap))
     end
 end

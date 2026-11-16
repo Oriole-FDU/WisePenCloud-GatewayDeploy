@@ -85,6 +85,9 @@ if [ "$OTEL_COLLECTOR_PORT" -lt 1 ] || [ "$OTEL_COLLECTOR_PORT" -gt 65535 ]; the
     exit 1
 fi
 
+# MCP OAuth 公网入口
+DEPLOY_MCP_OAUTH_ROUTE=${DEPLOY_MCP_OAUTH_ROUTE:-false}
+
 # ================= 工具函数 =================
 
 # 检查 jq 是否安装
@@ -131,11 +134,22 @@ function init_infrastructure() {
     LUA_AUTH=$(load_lua_script "$AUTH_TMP")
     rm -f "$AUTH_TMP"
 
+    local MCP_AUTH_TMP
+    MCP_AUTH_TMP=$(mktemp)
+    sed -e "s|@@REDIS_PASSWORD_B64@@|${REDIS_PASSWORD_B64}|g" \
+        -e "s|@@REDIS_URL@@|${REDIS_URL}|g" \
+        -e "s|@@REDIS_PORT@@|${REDIS_PORT}|g" \
+        "./scripts/mcp_auth.lua" >"$MCP_AUTH_TMP"
+    local LUA_MCP_AUTH
+    LUA_MCP_AUTH=$(load_lua_script "$MCP_AUTH_TMP")
+    rm -f "$MCP_AUTH_TMP"
+
     echo ">>> [2/2] 初始化全局模板 (ID: ${TPL_ID_GLOBAL})..."
     local body_global=$(jq -n \
         --argjson script_route "$LUA_ROUTE" \
         --argjson script_request_id "$LUA_REQUEST_ID" \
         --argjson script_auth "$LUA_AUTH" \
+        --argjson script_mcp_auth "$LUA_MCP_AUTH" \
         --argjson cors_regex_arr "$CORS_REGEX_JSON" \
         '{
             desc: "WisePen Global Template (Monitor + Routing + Auth + CORS)",
@@ -172,7 +186,7 @@ function init_infrastructure() {
                 },
                 "serverless-pre-function": {
                     "phase": "rewrite",
-                    "functions": [$script_route, $script_auth, $script_request_id]
+                    "functions": [$script_route, $script_auth, $script_mcp_auth, $script_request_id]
                 }
             }
         }')
@@ -444,6 +458,66 @@ function register_otel_route() {
     fi
 }
 
+# 注册 MCP OAuth 静态 well-known 元数据路由（网关本地返回，无 upstream）
+function register_mcp_metadata_route() {
+    local ID=$1
+    local URI=$2
+    local LUA_SCRIPT=$3
+    local NAME=$4
+
+    echo ">>> 注册 MCP OAuth 元数据路由 [$NAME] -> ${URI}"
+    local body=$(jq -n \
+        --arg name "$NAME" \
+        --arg uri "$URI" \
+        --argjson script "$LUA_SCRIPT" \
+        '{
+            name: $name,
+            uri: $uri,
+            methods: ["GET"],
+            plugins: {
+                "serverless-pre-function": { phase: "access", functions: [$script] }
+            }
+        }')
+    local RESPONSE=$(curl -s --noproxy "*" -w "\n%{http_code}" "${APISIX_ADMIN}/apisix/admin/routes/${ID}" -X PUT \
+        -H "X-API-KEY: ${ADMIN_KEY}" -d "$body")
+    local HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
+    local HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1)
+    if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+        echo "❌ [Error] 路由 [$NAME] 注册失败！状态码: ${HTTP_STATUS}"
+        echo ">>> APISIX 报错详情: ${HTTP_BODY}"
+        exit 1
+    fi
+}
+
+# 注册 MCP OAuth 相关路由（公网 /mcp + /oauth/* + well-known 元数据）
+function register_mcp_oauth_routes() {
+    local LUA_AS_META=$(load_lua_script "./scripts/mcp_as_metadata.lua")
+    local LUA_RS_META=$(load_lua_script "./scripts/mcp_rs_metadata.lua")
+
+    # /mcp 走全局模板（auth.lua 处理 Web cookie；mcp_auth.lua 处理 Bearer + 401 挑战）
+    register_route 1001 "mcp-service" '["/mcp","/mcp/"]' "wisepen-mcp-service"
+
+    # OAuth 端点走全局模板（session 鉴权 + X-From-Source），路径与 mcp-service 内部一致
+    register_route 1002 "mcp-oauth-authorize" "/oauth/authorize" "wisepen-mcp-service"
+    register_route 1003 "mcp-oauth-token" "/oauth/token" "wisepen-mcp-service"
+    register_route 1004 "mcp-oauth-revoke" "/oauth/revoke" "wisepen-mcp-service"
+    register_route 1007 "mcp-oauth-register" "/oauth/register" "wisepen-mcp-service"
+
+    register_mcp_metadata_route 1005 "/.well-known/oauth-authorization-server" "$LUA_AS_META" "mcp-oauth-as-metadata"
+    register_mcp_metadata_route 1006 "/mcp/.well-known/oauth-protected-resource" "$LUA_RS_META" "mcp-oauth-rs-metadata"
+}
+
+# 删除 MCP OAuth 相关路由（未启用时清理旧入口）
+function delete_mcp_oauth_routes() {
+    delete_route 1001 "mcp-service"
+    delete_route 1002 "mcp-oauth-authorize"
+    delete_route 1003 "mcp-oauth-token"
+    delete_route 1004 "mcp-oauth-revoke"
+    delete_route 1007 "mcp-oauth-register"
+    delete_route 1005 "mcp-oauth-as-metadata"
+    delete_route 1006 "mcp-oauth-rs-metadata"
+}
+
 echo "========================================="
 echo "   WisePen 网关部署脚本"
 echo "========================================="
@@ -512,6 +586,13 @@ register_frontend_route 3 '["/assets/*","/*"]'
 
 # 注册前端 OTel 上报入口
 register_otel_route 999
+
+# 注册 MCP OAuth 公网入口
+if [ "$DEPLOY_MCP_OAUTH_ROUTE" = "true" ]; then
+    register_mcp_oauth_routes
+else
+    delete_mcp_oauth_routes
+fi
 
 echo -e "\n========================================="
 echo "所有配置已推送到 APISIX !"
